@@ -1210,12 +1210,53 @@ local function nestHasRarity(nestId, rarityName)
     return false
 end
 
--- State V3
-local v3TargetBrainrot  = ""   -- nama brainrot yang dicari (internal name, lowercase)
-local v3TargetVariant   = ""   -- variant/mutasi target ("" = any)
-local v3TargetRarity    = ""   -- rarity dari brainrot target
+-- State V3 (multi-select)
+local v3TargetBrainrots = {}   -- SET nama brainrot yang dipilih (internal name lowercase) → true
+local v3TargetVariants  = {}   -- SET variant/mutasi target → true (kosong = any semua)
+local v3TargetRarities  = {}   -- SET rarity dari semua brainrot yang dipilih
+local v3TargetBrainrot  = ""   -- (compat) nama pertama, untuk notify
+local v3TargetVariant   = ""   -- (compat) variant pertama, untuk notify
+local v3TargetRarity    = ""   -- (compat) rarity pertama
 local v3BlacklistPos    = {}   -- blacklist posisi khusus V3 (reset per-run)
 local v3FailCount       = {}   -- hitungan fail per posisi
+
+-- Helper: apakah brainrotName cocok dengan target yang dipilih?
+local function v3MatchBrainrot(bName)
+    -- Jika tidak ada yang dipilih, match semua (fallback)
+    if next(v3TargetBrainrots) == nil then return true end
+    return v3TargetBrainrots[bName:gsub("%s+","")] == true
+end
+
+-- Helper: apakah variant cocok dengan target yang dipilih?
+local function v3MatchVariant(bVariant)
+    -- Jika kosong (any all) atau "any" ada di set → match semua
+    if next(v3TargetVariants) == nil or v3TargetVariants["any"] then return true end
+    return v3TargetVariants[bVariant] == true
+end
+
+-- Helper: dapatkan rarity tertinggi dari semua brainrot yang dipilih (untuk cari validNests)
+local function v3GetLowestRarity()
+    -- Cari rarity dengan RARITY_ORDER terendah supaya nestnya bisa cover semua target
+    local minRank = 99
+    local minRarity = ""
+    for _, b in ipairs(BRAINROT_LIST) do
+        local norm = b.name:lower():gsub("%s+","")
+        if v3TargetBrainrots[norm] then
+            local rank = RARITY_ORDER[b.rarity] or 0
+            if rank < minRank then
+                minRank   = rank
+                minRarity = b.rarity
+            end
+        end
+    end
+    if minRarity == "" then
+        -- Fallback ke rarity pertama di list
+        for _, b in ipairs(BRAINROT_LIST) do
+            minRarity = b.rarity; break
+        end
+    end
+    return minRarity
+end
 
 -- findBest khusus V3: hanya ambil brainrot yang namanya cocok (+ variant kalau diset)
 local function findBestV3(nestId)
@@ -1264,12 +1305,11 @@ local function findBestV3(nestId)
                         bVariant = (model:GetAttribute("variant") or "normal"):lower()
                     end)
 
-                    -- Cocokkan nama brainrot target (juga dinormalisasi)
-                    local targetNorm = v3TargetBrainrot:gsub("%s+", "")
-                    if bName ~= targetNorm then continue end
+                    -- Cocokkan nama brainrot (multi-select)
+                    if not v3MatchBrainrot(bName) then continue end
 
-                    -- Cocokkan variant kalau ada target variant
-                    if v3TargetVariant ~= "" and bVariant ~= v3TargetVariant then continue end
+                    -- Cocokkan variant (multi-select, "any" = semua)
+                    if not v3MatchVariant(bVariant) then continue end
 
                     local varPri = VARIANT_PRIORITY_FALLBACK[bVariant] or 0
                     if varPri > bestVarPri then
@@ -1289,7 +1329,7 @@ end
 local v3BrainrotDisplayList = {}
 local v3BrainrotDisplayMap  = {}  -- displayName → {name, rarity}
 for _, b in ipairs(BRAINROT_LIST) do
-    -- Format: "Pipi Kiwi (Common)"
+    -- Format: "pipiKiwi (Common)"
     local display = b.name .. " (" .. b.rarity .. ")"
     table.insert(v3BrainrotDisplayList, display)
     v3BrainrotDisplayMap[display] = {name=b.name, rarity=b.rarity}
@@ -1297,16 +1337,9 @@ end
 
 local VARIANT_LIST = {"any","normal","gold","diamond","blazing","poison","honey","astral"}
 
--- V3 selector state
-local v3SelectedDisplay = v3BrainrotDisplayList[1]
-local v3SelectedVariant = "any"
-do
-    local first = v3BrainrotDisplayMap[v3SelectedDisplay]
-    if first then
-        v3TargetBrainrot = first.name:lower()
-        v3TargetRarity   = first.rarity
-    end
-end
+-- V3 multi-select state (display)
+local v3SelectedDisplays = {}   -- set displayName → true
+local v3SelectedVariantSet = {["any"]=true}  -- default: any
 
 -- =============================================
 --  STATE & THREADS
@@ -1361,7 +1394,8 @@ local function startAutoBrainrotV3()
         end
 
         -- ── FASE 1: Bangun validNests SEKALI di awal ──────────────────
-        local targetRarity = v3TargetRarity
+        -- Pakai rarity terendah dari semua brainrot yang dipilih
+        local targetRarity = v3GetLowestRarity()
         local minNestId    = findMinNestForRarity(targetRarity)
 
         if not minNestId then
@@ -1389,7 +1423,17 @@ local function startAutoBrainrotV3()
         local validNests = {}
         for idx = startIdx, #NEST_ORDER do
             local nId = NEST_ORDER[idx]
-            if not nestHasRarity(nId, targetRarity) then continue end
+            -- Nest valid kalau bisa spawn minimal 1 rarity dari brainrot yang dipilih
+            local nestNeeded = false
+            if next(v3TargetRarities) == nil then
+                -- Tidak ada filter → semua nest valid
+                nestNeeded = nestHasRarity(nId, targetRarity)
+            else
+                for rar in pairs(v3TargetRarities) do
+                    if nestHasRarity(nId, rar) then nestNeeded = true; break end
+                end
+            end
+            if not nestNeeded then continue end
 
             local nDisplayName = nId
             for _, n in ipairs(nests) do
@@ -1511,9 +1555,14 @@ local function startAutoBrainrotV3()
                 continue
             end
 
-            local variantLabel = v3TargetVariant ~= "" and v3TargetVariant or "any"
+            local variantLabel = (next(v3TargetVariants) == nil or v3TargetVariants["any"]) and "any" or table.concat((function()
+                local t={}; for k in pairs(v3TargetVariants) do table.insert(t,k) end; return t
+            end)(), "/")
+            local brainrotLabel = (next(v3TargetBrainrots) == nil) and "all" or table.concat((function()
+                local t={}; for k in pairs(v3TargetBrainrots) do table.insert(t,k) end; return t
+            end)(), "/")
             notify("Auto Brainrot V3",
-                "Tween ke " .. v3TargetBrainrot .. " [" .. variantLabel .. "] di " .. nestToSearchName .. "...", 2)
+                "Tween ke " .. brainrotLabel .. " [" .. variantLabel .. "] di " .. nestToSearchName .. "...", 2)
 
             local grabbed = grabProximityPrompt(bestPrompt)
 
@@ -1525,7 +1574,16 @@ local function startAutoBrainrotV3()
             else
                 local success = waitDropButton(3)
                 if success then
-                    notify("Auto Brainrot V3", "✅ Dapat " .. v3TargetBrainrot .. "! Reset...", 3)
+                    local gotName = ""
+                    pcall(function()
+                        local att = bestPrompt.Parent
+                        local m = att and att.Parent
+                        if m then
+                            local n = m:GetAttribute("name")
+                            gotName = n and tostring(n) or m.Name
+                        end
+                    end)
+                    notify("Auto Brainrot V3", "✅ Dapat " .. gotName .. "! Reset...", 3)
                     tpAndReset()
                     waitRespawnAtBase()
                     notify("Auto Brainrot V3", "Loop ulang mencari target...", 2)
@@ -2025,28 +2083,61 @@ TabMainV2:Toggle({
 
 -- ── AUTO BRAINROT V3 UI ──────────────────────────────────────────
 TabMainV2:Dropdown({
-    ["Title"]   = "V3 · Pilih Brainrot",
+    ["Title"]   = "V3 · Pilih Brainrot (multi)",
     ["Values"]  = v3BrainrotDisplayList,
     ["Default"] = v3BrainrotDisplayList[1],
+    ["Multi"]   = true,
     ["Callback"] = function(val)
-        local data = v3BrainrotDisplayMap[val]
-        if data then
-            v3TargetBrainrot  = data.name:lower()
-            v3TargetRarity    = data.rarity
-            v3SelectedDisplay = val
-            notify("V3", "Target: " .. data.name .. " [" .. data.rarity .. "]", 2)
+        -- val bisa string (single) atau table (multi) tergantung library
+        v3TargetBrainrots = {}
+        v3TargetRarities  = {}
+        local function addEntry(v)
+            local data = v3BrainrotDisplayMap[v]
+            if data then
+                local norm = data.name:lower():gsub("%s+","")
+                v3TargetBrainrots[norm] = true
+                v3TargetRarities[data.rarity] = true
+                -- compat single
+                v3TargetBrainrot = data.name:lower()
+                v3TargetRarity   = data.rarity
+            end
         end
+        if type(val) == "table" then
+            for _, v in pairs(val) do addEntry(v) end
+        else
+            addEntry(val)
+        end
+        -- Hitung jumlah yang dipilih
+        local count = 0
+        for _ in pairs(v3TargetBrainrots) do count += 1 end
+        notify("V3", count .. " brainrot dipilih", 2)
     end,
 })
 
 TabMainV2:Dropdown({
-    ["Title"]   = "V3 · Pilih Mutasi",
+    ["Title"]   = "V3 · Pilih Mutasi (multi, any = semua)",
     ["Values"]  = VARIANT_LIST,
     ["Default"] = "any",
+    ["Multi"]   = true,
     ["Callback"] = function(val)
-        v3SelectedVariant = val
-        v3TargetVariant   = val == "any" and "" or val
-        notify("V3", "Mutasi target: " .. val, 2)
+        v3TargetVariants = {}
+        local function addVariant(v)
+            v3TargetVariants[v] = true
+            v3TargetVariant = v  -- compat
+            v3SelectedVariantSet[v] = true
+        end
+        if type(val) == "table" then
+            for _, v in pairs(val) do addVariant(v) end
+        else
+            addVariant(val)
+        end
+        -- Kalau "any" dipilih, clear yang lain
+        if v3TargetVariants["any"] then
+            v3TargetVariants = {["any"]=true}
+        end
+        local count = 0
+        for _ in pairs(v3TargetVariants) do count += 1 end
+        notify("V3", count .. " mutasi dipilih" .. (v3TargetVariants["any"] and " (semua)" or ""), 2)
     end,
 })
 
@@ -2056,21 +2147,26 @@ TabMainV2:Toggle({
     ["Callback"] = function(v)
         State.AutoBrainrotV3 = v
         if v then
-            -- Cek apakah rarity bisa dicapai (minimal Frogio Blingo untuk Infinity ke atas)
-            local minNestId = findMinNestForRarity(v3TargetRarity)
+            -- Gunakan rarity terendah dari semua target
+            local targetRarity = v3GetLowestRarity()
+            local minNestId = findMinNestForRarity(targetRarity)
             if not minNestId then
                 notify("Auto Brainrot V3", "Rarity tidak valid!", 3)
                 State.AutoBrainrotV3 = false
                 return
             end
-            -- Cek minimum nest notif (Frogio Blingo untuk Infinity, dll)
             local minNestName = minNestId
             for _, n in ipairs(nests) do
                 if n[2] == minNestId then minNestName = n[1]; break end
             end
+            -- Hitung berapa brainrot & variant yang dipilih
+            local bCount = 0; for _ in pairs(v3TargetBrainrots) do bCount += 1 end
+            local vCount = 0; for _ in pairs(v3TargetVariants) do vCount += 1 end
+            local anyVariant = v3TargetVariants["any"] or vCount == 0
             notify("Auto Brainrot V3",
-                "Start! Min nest: " .. minNestName ..
-                " | " .. v3TargetBrainrot .. " [" .. (v3TargetVariant ~= "" and v3TargetVariant or "any") .. "]", 3)
+                "Start! " .. bCount .. " brainrot | " ..
+                (anyVariant and "any mutasi" or vCount .. " mutasi") ..
+                " | Min: " .. minNestName, 4)
             v3BlacklistPos = {}
             v3FailCount    = {}
             startAutoBrainrotV3()
